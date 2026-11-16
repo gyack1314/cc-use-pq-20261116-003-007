@@ -49,11 +49,16 @@ class Inspector:
                 statuses[row["status"]][row["group_id"]] = row["count"]
             analyses = db.execute("SELECT count(*) AS count,coalesce(max(source_revision),0) AS newest"
                                   " FROM analyses WHERE campaign_id=?", (campaign_id,)).fetchone()
+            cohorts = db.execute("SELECT count(*) FROM analyses WHERE campaign_id=? AND kind='cohort'",
+                                 (campaign_id,)).fetchone()[0]
+            formulations = db.execute("SELECT count(*) FROM formulations WHERE campaign_id=?"
+                                      " AND state='usable'", (campaign_id,)).fetchone()[0]
             releases = db.execute("SELECT count(*) FROM releases WHERE campaign_id=?", (campaign_id,)).fetchone()[0]
             last_audit = db.execute("SELECT max(id) FROM audits WHERE campaign_id=?", (campaign_id,)).fetchone()[0]
             return {"campaign_id": campaign_id, "spec_version": campaign["spec"]["version"],
                     "revision": campaign["revision"], "batches": dict(batches),
                     "samples": dict(statuses), "analyses": dict(analyses),
+                    "cohort_analyses": cohorts, "formulation_versions": formulations,
                     "releases": releases, "last_audit_id": last_audit}
 
     def coverage(self, campaign_id: str, start: str, end: str) -> dict[str, Any]:
@@ -125,7 +130,7 @@ class Inspector:
     def release_context(self, campaign_id: str, release_id: str) -> dict[str, Any]:
         release = self.store.get_release(campaign_id, release_id)
         with self.store.connect() as db:
-            reviews = db.execute("SELECT reviewer,decision,note,created_at FROM reviews"
+            reviews = db.execute("SELECT reviewer,decision,note,cohort_sha,created_at FROM reviews"
                                  " WHERE campaign_id=? AND analysis_id=? ORDER BY reviewer",
                                  (campaign_id, release["analysis_id"])).fetchall()
             audit = db.execute("SELECT id,actor,at FROM audits WHERE campaign_id=?"
@@ -133,6 +138,8 @@ class Inspector:
                                (campaign_id, release_id)).fetchone()
             return {"release_id": release_id, "release_sha": release["body"]["release_sha"],
                     "source_revision": release["source_revision"],
+                    "analysis_kind": release["body"].get("kind", "campaign"),
+                    "cohort_sha": release["body"].get("cohort_sha"),
                     "analysis_result_sha": release["result_sha"],
                     "reviews": [dict(row) for row in reviews],
                     "audit": dict(audit) if audit else None}

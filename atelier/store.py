@@ -36,6 +36,19 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL,
     PRIMARY KEY(campaign_id, batch_id)
 );
+CREATE TABLE IF NOT EXISTS formulations (
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    formulation_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    definition_sha TEXT NOT NULL,
+    state TEXT NOT NULL,
+    lineage_revision INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_id, formulation_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_formulations_family ON formulations(campaign_id,formulation_id,version);
 CREATE TABLE IF NOT EXISTS samples (
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
     sample_id TEXT NOT NULL,
@@ -43,6 +56,8 @@ CREATE TABLE IF NOT EXISTS samples (
     group_id TEXT NOT NULL,
     event_time TEXT NOT NULL,
     spec_version INTEGER NOT NULL,
+    formulation_id TEXT,
+    formulation_version INTEGER,
     measurements TEXT NOT NULL,
     content_sha TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -72,11 +87,35 @@ CREATE TABLE IF NOT EXISTS audits (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audits_campaign ON audits(campaign_id,id);
+CREATE TABLE IF NOT EXISTS comparability_rules (
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    rule_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    content_sha TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_id,rule_id)
+);
+CREATE TABLE IF NOT EXISTS comparability_rule_versions (
+    campaign_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    content_sha TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_id,rule_id,revision)
+);
 CREATE TABLE IF NOT EXISTS analyses (
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
     analysis_id TEXT NOT NULL,
     request_sha TEXT NOT NULL,
     source_revision INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'campaign',
+    cohort_sha TEXT,
+    rule_id TEXT,
+    rule_revision INTEGER,
+    lineage_sha TEXT,
     body TEXT NOT NULL,
     result_sha TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -89,6 +128,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     decision TEXT NOT NULL,
     note TEXT NOT NULL,
     result_sha TEXT NOT NULL,
+    cohort_sha TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY(campaign_id,analysis_id,reviewer),
     FOREIGN KEY(campaign_id,analysis_id) REFERENCES analyses(campaign_id,analysis_id)
@@ -122,6 +162,23 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        """Keep databases created by earlier releases readable in place."""
+        columns = {row[1] for row in db.execute("PRAGMA table_info(samples)")}
+        for name, kind in (("formulation_id", "TEXT"), ("formulation_version", "INTEGER")):
+            if name not in columns:
+                db.execute(f"ALTER TABLE samples ADD COLUMN {name} {kind}")
+        analysis_columns = {row[1] for row in db.execute("PRAGMA table_info(analyses)")}
+        for name, kind in (("kind", "TEXT NOT NULL DEFAULT 'campaign'"), ("cohort_sha", "TEXT"),
+                           ("rule_id", "TEXT"), ("rule_revision", "INTEGER"), ("lineage_sha", "TEXT")):
+            if name not in analysis_columns:
+                db.execute(f"ALTER TABLE analyses ADD COLUMN {name} {kind}")
+        review_columns = {row[1] for row in db.execute("PRAGMA table_info(reviews)")}
+        if "cohort_sha" not in review_columns:
+            db.execute("ALTER TABLE reviews ADD COLUMN cohort_sha TEXT")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=20, isolation_level=None, factory=ClosingConnection)
@@ -233,7 +290,10 @@ class Store:
                 params.append(value)
         rows = db.execute("SELECT * FROM samples WHERE " + " AND ".join(clauses) +
                           " ORDER BY event_time,sample_id", params).fetchall()
-        return [{**dict(row), "measurements": json.loads(row["measurements"])} for row in rows]
+        return [{**dict(row), "measurements": json.loads(row["measurements"]),
+                 "formulation": ({"formulation_id": row["formulation_id"],
+                                  "version": row["formulation_version"]}
+                                 if row["formulation_id"] else None)} for row in rows]
 
     def list_audits(self, campaign_id: str, since_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as db:

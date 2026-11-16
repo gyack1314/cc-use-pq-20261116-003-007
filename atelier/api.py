@@ -7,7 +7,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .analysis import Analyzer
+from .cohort import Cohorts
 from .domain import CampaignSpec, DomainError, integer, parse_time, require_identifier
+from .formulation import Lineage
 from .ingest import Ingestor
 from .inspection import Inspector
 from .evidence import EvidenceService
@@ -30,13 +32,16 @@ def create_app(database_path: str | None = None) -> FastAPI:
     query_service = QueryService(store)
     explorer = Explorer(store)
     lifecycle = Lifecycle(store)
+    lineage = Lineage(store)
+    cohorts = Cohorts(store)
     app = FastAPI(title="Atelier Experiment Ledger", version="1.0.0")
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_, error: DomainError):
         status = 404 if error.code == "not_found" else 409 if error.code.endswith("conflict") or error.code in {
             "stale_analysis", "inactive_sample", "release_conflict", "review_rejected",
-            "reviews_missing", "self_publish", "quality_failed", "incompatible_spec"} else 422
+            "reviews_missing", "self_publish", "quality_failed", "incompatible_spec",
+            "missing_parent", "lineage_cycle", "definition_conflict", "stale_lineage"} else 422
         return JSONResponse(status_code=status, content={"error": error.code, "detail": str(error)})
 
     @app.post("/campaigns", status_code=201)
@@ -86,6 +91,54 @@ def create_app(database_path: str | None = None) -> FastAPI:
         actor = require_identifier(payload.get("actor"), "actor")
         expected = integer(payload.get("expected_version"), "expected_version", 1, 1000000)
         return store.update_spec(campaign_id, payload, expected, actor)
+
+    @app.post("/campaigns/{campaign_id}/formulations/{formulation_id}", status_code=201)
+    def register_formulation(campaign_id: str, formulation_id: str, payload: dict[str, Any]):
+        return lineage.register(campaign_id, formulation_id, payload, payload.get("actor"))
+
+    @app.get("/campaigns/{campaign_id}/formulations")
+    def list_formulations(campaign_id: str):
+        return lineage.list_versions(campaign_id)
+
+    @app.get("/campaigns/{campaign_id}/formulations/{formulation_id}/{version}")
+    def get_formulation(campaign_id: str, formulation_id: str, version: int):
+        return lineage.get(campaign_id, formulation_id, version)
+
+    @app.get("/campaigns/{campaign_id}/formulations/{formulation_id}/{version}/rules")
+    def formulation_rules(campaign_id: str, formulation_id: str, version: int):
+        return lineage.applicable_rules(campaign_id, formulation_id, version)
+
+    @app.get("/campaigns/{campaign_id}/formulations/{formulation_id}/{version}/ancestors")
+    def formulation_ancestors(campaign_id: str, formulation_id: str, version: int):
+        entry = lineage.get(campaign_id, formulation_id, version)
+        snapshot = lineage.snapshot(campaign_id, [{"formulation_id": formulation_id,
+                                                    "version": version}])
+        return {"formulation_id": formulation_id, "version": version,
+                "parent": entry["parent"], "ancestors": snapshot,
+                "lineage_sha": Lineage.snapshot_sha(snapshot)}
+
+    @app.put("/campaigns/{campaign_id}/formulations/{formulation_id}/{version}/lineage")
+    def adjust_lineage(campaign_id: str, formulation_id: str, version: int, payload: dict[str, Any]):
+        return lineage.adjust(campaign_id, formulation_id, version, payload, payload.get("actor"))
+
+    @app.put("/campaigns/{campaign_id}/comparability-rules/{rule_id}")
+    def declare_rule(campaign_id: str, rule_id: str, payload: dict[str, Any]):
+        return lineage.declare_rule(campaign_id, rule_id, payload, payload.get("actor"))
+
+    @app.get("/campaigns/{campaign_id}/comparability-rules")
+    def list_rules(campaign_id: str):
+        return lineage.list_rules(campaign_id)
+
+    @app.get("/campaigns/{campaign_id}/comparability-rules/{rule_id}")
+    def get_rule(campaign_id: str, rule_id: str):
+        rule = lineage.get_rule(campaign_id, rule_id)
+        if rule is None:
+            raise DomainError("not_found", "comparability rule does not exist")
+        return rule
+
+    @app.get("/campaigns/{campaign_id}/comparability-rules/{rule_id}/history")
+    def rule_history(campaign_id: str, rule_id: str):
+        return lineage.rule_history(campaign_id, rule_id)
 
     @app.post("/campaigns/{campaign_id}/batches/{batch_id}")
     def ingest(campaign_id: str, batch_id: str, payload: dict[str, Any]):
@@ -144,6 +197,19 @@ def create_app(database_path: str | None = None) -> FastAPI:
         return analyzer.build(campaign_id, analysis_id, payload.get("start"),
                               payload.get("end"), payload.get("actor"))
 
+    @app.post("/campaigns/{campaign_id}/cohorts/{analysis_id}", status_code=201)
+    def build_cohort(campaign_id: str, analysis_id: str, payload: dict[str, Any]):
+        return cohorts.build(campaign_id, analysis_id, payload.get("rule_id"),
+                             payload.get("start"), payload.get("end"), payload.get("actor"))
+
+    @app.get("/campaigns/{campaign_id}/cohorts/{analysis_id}/status")
+    def cohort_status(campaign_id: str, analysis_id: str):
+        return cohorts.status(campaign_id, analysis_id)
+
+    @app.get("/campaigns/{campaign_id}/cohorts/impact")
+    def cohort_impact(campaign_id: str):
+        return cohorts.impact(campaign_id)
+
     @app.get("/campaigns/{campaign_id}/analyses")
     def list_analyses(campaign_id: str, limit: int = Query(100, ge=1, le=500)):
         return analyzer.list_analyses(campaign_id, limit)
@@ -185,6 +251,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @app.get("/campaigns/{campaign_id}/releases/{release_id}/context")
     def release_context(campaign_id: str, release_id: str):
         return inspector.release_context(campaign_id, release_id)
+
+    @app.get("/campaigns/{campaign_id}/releases/{release_id}/lineage")
+    def release_lineage(campaign_id: str, release_id: str):
+        return cohorts.historical_report(campaign_id, release_id)
 
     @app.get("/campaigns/{campaign_id}/audits")
     def audits(campaign_id: str, since_id: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)):

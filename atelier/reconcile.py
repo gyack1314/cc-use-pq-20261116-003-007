@@ -51,21 +51,32 @@ class Reconciler:
 
     def analysis_freshness(self, campaign_id: str) -> dict[str, Any]:
         require_identifier(campaign_id, "campaign_id")
+        from .cohort import Cohorts
+        cohorts = Cohorts(self.store)
         with self.store.connect() as db:
             campaign = self.store.get_campaign(campaign_id, db)
-            rows = db.execute("SELECT analysis_id,source_revision,result_sha,body FROM analyses"
-                              " WHERE campaign_id=? ORDER BY analysis_id", (campaign_id,)).fetchall()
+            rows = db.execute("SELECT analysis_id,kind,source_revision,cohort_sha,result_sha,body"
+                              " FROM analyses WHERE campaign_id=? ORDER BY analysis_id",
+                              (campaign_id,)).fetchall()
             analyses = []
             for row in rows:
                 body = json.loads(row["body"])
                 body_sha = body.pop("result_sha", None)
-                analyses.append({"analysis_id": row["analysis_id"],
+                fresh = row["source_revision"] == campaign["revision"]
+                cohort_current = None
+                if row["kind"] == "cohort":
+                    refreshed = cohorts.refresh(body, db)
+                    cohort_current = refreshed["cohort_current"]
+                    fresh = fresh and cohort_current
+                analyses.append({"analysis_id": row["analysis_id"], "kind": row["kind"],
                                  "source_revision": row["source_revision"],
                                  "current_revision": campaign["revision"],
-                                 "fresh": row["source_revision"] == campaign["revision"],
+                                 "fresh": fresh, "cohort_current": cohort_current,
                                  "digest_valid": body_sha == row["result_sha"] == digest(body)})
             return {"campaign_id": campaign_id, "analyses": analyses,
-                    "invalid_digests": [row["analysis_id"] for row in analyses if not row["digest_valid"]]}
+                    "invalid_digests": [row["analysis_id"] for row in analyses if not row["digest_valid"]],
+                    "stale_cohorts": [row["analysis_id"] for row in analyses
+                                      if row["cohort_current"] is False]}
 
     def releases(self, campaign_id: str) -> dict[str, Any]:
         require_identifier(campaign_id, "campaign_id")
@@ -77,19 +88,22 @@ class Reconciler:
             for row in rows:
                 body = json.loads(row["body"])
                 release_sha = body.pop("release_sha", None)
-                analysis = db.execute("SELECT result_sha FROM analyses WHERE campaign_id=? AND analysis_id=?",
+                analysis = db.execute("SELECT result_sha,cohort_sha FROM analyses WHERE campaign_id=?"
+                                      " AND analysis_id=?",
                                       (campaign_id, row["analysis_id"])).fetchone()
-                approvals = db.execute("SELECT reviewer,decision,result_sha FROM reviews"
+                approvals = db.execute("SELECT reviewer,decision,result_sha,cohort_sha FROM reviews"
                                        " WHERE campaign_id=? AND analysis_id=?", (campaign_id, row["analysis_id"])).fetchall()
                 valid_approvals = {item["reviewer"] for item in approvals
-                                   if item["decision"] == "approve" and item["result_sha"] == row["result_sha"]}
+                                   if item["decision"] == "approve" and item["result_sha"] == row["result_sha"]
+                                   and item["cohort_sha"] == body.get("cohort_sha")}
                 rejected = any(item["decision"] == "reject" for item in approvals)
                 result = {"release_id": row["release_id"],
                           "release_digest_valid": release_sha == digest(body),
                           "analysis_digest_valid": analysis is not None and analysis["result_sha"] == row["result_sha"],
                           "approvals": sorted(valid_approvals), "rejected": rejected}
                 result["matches"] = (result["release_digest_valid"] and result["analysis_digest_valid"]
-                                     and len(valid_approvals) >= 2 and not rejected)
+                                     and len(valid_approvals) >= 2 and not rejected
+                                     and body.get("cohort_sha") == (analysis["cohort_sha"] if analysis else None))
                 releases.append(result)
             return {"campaign_id": campaign_id, "matches": all(row["matches"] for row in releases),
                     "releases": releases}

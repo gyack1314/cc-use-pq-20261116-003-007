@@ -4,10 +4,14 @@ import json
 from typing import Any
 
 from .domain import CampaignSpec, DomainError, canonical, digest, parse_time, require_identifier, utc_now
+from .formulation import Lineage
 from .store import Store
 
 
-def normalize_sample(spec: CampaignSpec, item: Any) -> dict[str, Any]:
+def normalize_sample(spec: CampaignSpec, item: Any,
+                     lineage: Lineage | None = None,
+                     campaign_id: str | None = None,
+                     db: Any = None, require_formulation: bool = False) -> dict[str, Any]:
     if not isinstance(item, dict):
         raise DomainError("invalid_sample", "sample must be an object")
     sample_id = require_identifier(item.get("sample_id"), "sample_id")
@@ -16,8 +20,16 @@ def normalize_sample(spec: CampaignSpec, item: Any) -> dict[str, Any]:
         raise DomainError("unknown_group", "sample group is not declared")
     event_time = parse_time(item.get("event_time"))
     measurements = spec.validate_measurements(item.get("measurements"))
-    return {"sample_id": sample_id, "group_id": group_id, "event_time": event_time,
-            "measurements": measurements, "spec_version": spec.version}
+    formulation = None
+    if lineage is not None:
+        formulation = lineage.sample_binding(campaign_id, item, db, require_formulation)
+    elif require_formulation:
+        raise DomainError("missing_formulation", "samples must name a formulation version")
+    result = {"sample_id": sample_id, "group_id": group_id, "event_time": event_time,
+              "measurements": measurements, "spec_version": spec.version}
+    if formulation is not None:
+        result["formulation"] = formulation
+    return result
 
 
 class Ingestor:
@@ -42,13 +54,16 @@ class Ingestor:
                     raise DomainError("batch_conflict", "batch id already names different content")
                 return {**json.loads(existing["body"]), "replayed": True}
             spec = self.store.get_spec(campaign_id, db=db)
+            lineage = Lineage(self.store)
+            require_formulation = lineage.has_versions(campaign_id, db)
             accepted = []
             rejected = []
             seen = set()
             now = utc_now()
             for ordinal, raw in enumerate(samples):
                 try:
-                    sample = normalize_sample(spec, raw)
+                    sample = normalize_sample(spec, raw, lineage, campaign_id, db,
+                                              require_formulation)
                     sample_id = sample["sample_id"]
                     if sample_id in seen:
                         raise DomainError("duplicate_in_batch", "sample id repeated in this batch")
@@ -59,11 +74,14 @@ class Ingestor:
                         if prior["content_sha"] == digest(sample):
                             raise DomainError("already_ingested", "sample was already accepted")
                         raise DomainError("sample_conflict", "sample id has different accepted content")
+                    formulation = sample.get("formulation")
                     db.execute("INSERT INTO samples(campaign_id,sample_id,batch_id,group_id,event_time,"
-                               "spec_version,measurements,content_sha,status,created_at,updated_at)"
-                               "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                               "spec_version,formulation_id,formulation_version,measurements,content_sha,"
+                               "status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                (campaign_id, sample_id, batch_id, sample["group_id"], sample["event_time"],
-                                spec.version, canonical(sample["measurements"]), digest(sample),
+                                spec.version, formulation["formulation_id"] if formulation else None,
+                                formulation["version"] if formulation else None,
+                                canonical(sample["measurements"]), digest(sample),
                                 "active", now, now))
                     accepted.append(sample_id)
                 except DomainError as error:
@@ -106,18 +124,28 @@ class Ingestor:
             if row["status"] != "active":
                 raise DomainError("inactive_sample", "only active samples may be corrected")
             spec = self.store.get_spec(campaign_id, db=db)
-            normalized = normalize_sample(spec, replacement)
+            lineage = Lineage(self.store)
+            require_formulation = lineage.has_versions(campaign_id, db)
+            normalized = normalize_sample(spec, replacement, lineage, campaign_id, db,
+                                          require_formulation)
             if normalized["sample_id"] != sample_id:
                 raise DomainError("identity_change", "correction cannot change sample id")
             previous = {"sample_id": sample_id, "group_id": row["group_id"],
                         "event_time": row["event_time"], "spec_version": row["spec_version"],
+                        "formulation": ({"formulation_id": row["formulation_id"],
+                                         "version": row["formulation_version"]}
+                                        if row["formulation_id"] else None),
                         "measurements": json.loads(row["measurements"]), "content_sha": row["content_sha"]}
             next_sha = digest(normalized)
             if next_sha == row["content_sha"]:
                 return {**previous, "changed": False}
-            db.execute("UPDATE samples SET group_id=?, event_time=?,spec_version=?,measurements=?,"
-                       "content_sha=?,updated_at=? WHERE campaign_id=? AND sample_id=?",
+            formulation = normalized.get("formulation")
+            db.execute("UPDATE samples SET group_id=?, event_time=?,spec_version=?,formulation_id=?,"
+                       "formulation_version=?,measurements=?,content_sha=?,updated_at=?"
+                       " WHERE campaign_id=? AND sample_id=?",
                        (normalized["group_id"], normalized["event_time"], spec.version,
+                        formulation["formulation_id"] if formulation else None,
+                        formulation["version"] if formulation else None,
                         canonical(normalized["measurements"]), next_sha, utc_now(), campaign_id, sample_id))
             self.store.bump(db, campaign_id)
             result = {**normalized, "content_sha": next_sha, "changed": True}

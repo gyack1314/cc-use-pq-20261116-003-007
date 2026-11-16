@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .cohort import Cohorts
 from .domain import DomainError, canonical, digest, require_identifier, utc_now
 from .store import Store
 
@@ -25,23 +26,30 @@ class Publisher:
             campaign = self.store.get_campaign(campaign_id, db)
             if analysis["result_sha"] != expected_sha:
                 raise DomainError("version_conflict", "analysis digest changed")
-            if analysis["source_revision"] != campaign["revision"]:
-                raise DomainError("stale_analysis", "analysis no longer matches source revision")
+            cohort_current = True
+            if analysis["body"].get("kind") == "cohort":
+                refreshed = Cohorts(self.store).refresh(analysis["body"], db)
+                cohort_current = refreshed["cohort_current"]
+            if analysis["source_revision"] != campaign["revision"] or not cohort_current:
+                raise DomainError("stale_analysis",
+                                  "analysis no longer matches its source cohort or revision")
             if not analysis["body"]["quality"]["passed"]:
                 raise DomainError("quality_failed", "quality gates prevent review")
             existing = db.execute("SELECT * FROM reviews WHERE campaign_id=? AND analysis_id=? AND reviewer=?",
                                   (campaign_id, analysis_id, reviewer)).fetchone()
             result = {"campaign_id": campaign_id, "analysis_id": analysis_id,
                       "reviewer": reviewer, "decision": decision,
-                      "note": note.strip(), "result_sha": expected_sha}
+                      "note": note.strip(), "result_sha": expected_sha,
+                      "cohort_sha": analysis["cohort_sha"]}
             if existing:
                 if existing["decision"] == decision and existing["note"] == note.strip() and existing["result_sha"] == expected_sha:
                     return {**result, "replayed": True}
                 raise DomainError("review_conflict", "reviewer has already made a different decision")
             now = utc_now()
-            db.execute("INSERT INTO reviews(campaign_id,analysis_id,reviewer,decision,note,result_sha,created_at)"
-                       " VALUES(?,?,?,?,?,?,?)", (campaign_id, analysis_id, reviewer, decision,
-                                                  note.strip(), expected_sha, now))
+            db.execute("INSERT INTO reviews(campaign_id,analysis_id,reviewer,decision,note,result_sha,"
+                       "cohort_sha,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (campaign_id, analysis_id, reviewer, decision, note.strip(), expected_sha,
+                        analysis["cohort_sha"], now))
             self.store.audit(db, campaign_id, "analysis_reviewed", reviewer, analysis_id,
                              None, {**result, "created_at": now})
             return {**result, "created_at": now, "replayed": False}
@@ -63,16 +71,23 @@ class Publisher:
             campaign = self.store.get_campaign(campaign_id, db)
             if analysis["result_sha"] != expected_sha:
                 raise DomainError("version_conflict", "analysis digest changed")
-            if analysis["source_revision"] != campaign["revision"]:
-                raise DomainError("stale_analysis", "analysis no longer matches source revision")
+            cohort_current = True
+            if analysis["body"].get("kind") == "cohort":
+                refreshed = Cohorts(self.store).refresh(analysis["body"], db)
+                cohort_current = refreshed["cohort_current"]
+            if analysis["source_revision"] != campaign["revision"] or not cohort_current:
+                raise DomainError("stale_analysis",
+                                  "analysis no longer matches its source cohort or revision")
             if not analysis["body"]["quality"]["passed"]:
                 raise DomainError("quality_failed", "quality gates prevent publication")
-            decisions = db.execute("SELECT reviewer,decision,note,result_sha FROM reviews"
+            decisions = db.execute("SELECT reviewer,decision,note,result_sha,cohort_sha FROM reviews"
                                    " WHERE campaign_id=? AND analysis_id=? ORDER BY reviewer",
                                    (campaign_id, analysis_id)).fetchall()
             if any(row["decision"] == "reject" for row in decisions):
                 raise DomainError("review_rejected", "a reviewer rejected the analysis")
-            approved = [dict(row) for row in decisions if row["decision"] == "approve" and row["result_sha"] == expected_sha]
+            approved = [dict(row) for row in decisions
+                        if row["decision"] == "approve" and row["result_sha"] == expected_sha
+                        and row["cohort_sha"] == analysis["cohort_sha"]]
             if len(approved) < 2:
                 raise DomainError("reviews_missing", "two independent approvals are required")
             if actor in {row["reviewer"] for row in approved}:
@@ -80,6 +95,8 @@ class Publisher:
             now = utc_now()
             result = {"campaign_id": campaign_id, "release_id": release_id,
                       "analysis_id": analysis_id, "source_revision": analysis["source_revision"],
+                      "kind": analysis["body"].get("kind", "campaign"),
+                      "cohort_sha": analysis["cohort_sha"],
                       "result_sha": expected_sha, "approved_by": [row["reviewer"] for row in approved],
                       "published_by": actor, "created_at": now, "analysis": analysis["body"],
                       "replayed": False}

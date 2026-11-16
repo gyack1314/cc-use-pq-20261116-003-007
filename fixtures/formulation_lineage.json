@@ -1,0 +1,35 @@
+{
+  "campaign": {
+    "campaign_id": "coating_series",
+    "title": "Synthetic coating formulation series",
+    "groups": ["control", "process_b"],
+    "baseline": "control",
+    "metrics": [{"name": "yield_pct", "unit": "percent", "minimum": "0", "maximum": "100", "precision": 2}],
+    "min_samples": 2,
+    "max_bad_fraction": "0.2",
+    "window_hours": 24
+  },
+  "window": {"start": "2026-03-01T00:00:00Z", "end": "2026-03-02T00:00:00Z"},
+  "formulations": [
+    {"formulation_id": "coat", "version": 1, "name": "coat_v1",
+     "parameters": {"solvent": "water", "cure": "ambient"}, "basis": ["line_a_2026"]},
+    {"formulation_id": "coat", "version": 2, "name": "coat_v1",
+     "parameters": {"solvent": "ethanol", "cure": "ambient"}, "basis": ["line_b_2026"],
+     "parent": {"formulation_id": "coat", "version": 1}}
+  ],
+  "comparability_rule": {
+    "rule_id": "same_line",
+    "description": "Only versions sharing the declared production line basis",
+    "basis": "line_a_2026"
+  },
+  "batches": [{"batch_id": "batch_one", "samples": [
+    {"sample_id": "sample_a", "group_id": "control", "event_time": "2026-03-01T01:00:00Z", "formulation": {"formulation_id": "coat", "version": 1}, "measurements": {"yield_pct": "71.20"}},
+    {"sample_id": "sample_b", "group_id": "control", "event_time": "2026-03-01T02:00:00Z", "formulation": {"formulation_id": "coat", "version": 1}, "measurements": {"yield_pct": "72.20"}},
+    {"sample_id": "sample_c", "group_id": "process_b", "event_time": "2026-03-01T03:00:00Z", "formulation": {"formulation_id": "coat", "version": 1}, "measurements": {"yield_pct": "78.50"}},
+    {"sample_id": "sample_d", "group_id": "process_b", "event_time": "2026-03-01T04:00:00Z", "formulation": {"formulation_id": "coat", "version": 1}, "measurements": {"yield_pct": "79.50"}},
+    {"sample_id": "sample_e", "group_id": "control", "event_time": "2026-03-01T05:00:00Z", "formulation": {"formulation_id": "coat", "version": 2}, "measurements": {"yield_pct": "80.00"}},
+    {"sample_id": "sample_f", "group_id": "process_b", "event_time": "2026-03-01T06:00:00Z", "formulation": {"formulation_id": "coat", "version": 2}, "measurements": {"yield_pct": "87.00"}},
+    {"sample_id": "sample_g", "group_id": "control", "event_time": "2026-03-01T07:00:00Z", "formulation": {"formulation_id": "coat", "version": 2}, "measurements": {"yield_pct": "81.00"}},
+    {"sample_id": "sample_h", "group_id": "process_b", "event_time": "2026-03-01T08:00:00Z", "formulation": {"formulation_id": "coat", "version": 2}, "measurements": {"yield_pct": "88.00"}}
+  ]}]
+}

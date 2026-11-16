@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from .domain import DomainError, canonical, digest, require_identifier, utc_now
+from .formulation import Lineage
 from .quality import metric_health, summarize_quality, validate_window
 from .store import Store
 
@@ -87,25 +88,40 @@ class Analyzer:
                 return {**json.loads(old["body"]), "replayed": True,
                         "current": old["source_revision"] == current["revision"]}
             samples = self.store.list_samples(campaign_id, start=start, end=end, db=db)
+            sample_refs = [{"formulation_id": sample["formulation_id"],
+                            "version": sample["formulation_version"]}
+                           for sample in samples
+                           if sample["status"] == "active" and sample.get("formulation_id")]
+            lineage_snapshot = Lineage(self.store).snapshot(campaign_id, sample_refs, db)
+            lineage_sha = Lineage.snapshot_sha(lineage_snapshot)
             rejection_rows = db.execute("SELECT batch_id,reason,detail,event_time FROM rejections"
                                         " WHERE campaign_id=? AND event_time>=? AND event_time<?"
                                         " ORDER BY batch_id,ordinal", (campaign_id, start, end)).fetchall()
             rejections = [dict(row) for row in rejection_rows]
             quality = summarize_quality(spec, samples, rejections, start, end)
             groups = group_statistics(spec, samples)
-            result = {"campaign_id": campaign_id, "analysis_id": analysis_id,
+            versions = sorted({f"{sample['formulation_id']}@{sample['formulation_version']}"
+                               for sample in samples if sample["status"] == "active"
+                               and sample.get("formulation_id")})
+            if len(versions) > 1:
+                quality["gates"] = sorted(set(quality["gates"]) | {"multiple_formulations"})
+                quality["passed"] = False
+            result = {"campaign_id": campaign_id, "analysis_id": analysis_id, "kind": "campaign",
                       "request": request, "source_revision": current["revision"],
                       "quality": quality, "metric_health": metric_health(spec, samples),
+                      "lineage_snapshot": lineage_snapshot, "lineage_sha": lineage_sha,
                       "groups": groups, "contrasts": contrasts(spec, groups),
+                      "formulation_versions": versions,
+                      "interpretation": ("group-name interpretation; use cohort analysis when "
+                                         "formulation versions are not interchangeable"),
                       "created_at": utc_now(), "replayed": False, "current": True}
-            result_sha = digest(result)
-            result["result_sha"] = result_sha
-            db.execute("INSERT INTO analyses(campaign_id,analysis_id,request_sha,source_revision,body,"
-                       "result_sha,created_at) VALUES(?,?,?,?,?,?,?)",
-                       (campaign_id, analysis_id, request_sha, current["revision"], canonical(result),
-                        result_sha, result["created_at"]))
+            result["result_sha"] = digest(result)
+            db.execute("INSERT INTO analyses(campaign_id,analysis_id,request_sha,source_revision,kind,"
+                       "body,result_sha,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (campaign_id, analysis_id, request_sha, current["revision"], "campaign",
+                        canonical(result), result["result_sha"], result["created_at"]))
             self.store.audit(db, campaign_id, "analysis_created", actor, analysis_id, None,
-                             {"result_sha": result_sha, "source_revision": current["revision"]})
+                             {"result_sha": result["result_sha"], "source_revision": current["revision"]})
             return result
 
     def status(self, campaign_id: str, analysis_id: str) -> dict[str, Any]:
@@ -120,7 +136,8 @@ class Analyzer:
     def list_analyses(self, campaign_id: str, limit: int = 100) -> list[dict[str, Any]]:
         with self.store.connect() as db:
             self.store.get_campaign(campaign_id, db)
-            rows = db.execute("SELECT analysis_id,source_revision,result_sha,created_at"
-                              " FROM analyses WHERE campaign_id=? ORDER BY created_at DESC LIMIT ?",
+            rows = db.execute("SELECT analysis_id,kind,rule_id,rule_revision,cohort_sha,source_revision,"
+                              "result_sha,created_at FROM analyses WHERE campaign_id=?"
+                              " ORDER BY created_at DESC LIMIT ?",
                               (campaign_id, limit)).fetchall()
             return [dict(row) for row in rows]
